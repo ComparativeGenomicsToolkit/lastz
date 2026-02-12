@@ -126,6 +126,7 @@ char* programRevisionDate    = REVISION_DATE;
 #include <string.h>				// standard C string stuff
 #include <ctype.h>				// standard C upper/lower stuff
 #include <stdarg.h>				// standard C variable argument list stuff
+#include <limits.h>				// standard C value limit stuff
 #include <math.h>				// standard C math stuff
 #include <time.h>				// standard C time stuff
 #include "build_options.h"		// build options
@@ -415,12 +416,17 @@ static const control defaultParams =
 #ifdef densityFiltering
 	0.0,								// maxDensity
 #endif // densityFiltering
+#ifndef forbidBandWidth
+	0,									// bandWidth (zero => no band restriction)
+#endif // not forbidBandWidth
 	NULL,NULL,							// outputFilename, outputFile
-	fmtLav,NULL,NULL,NULL,				// outputFormat, outputInfo, readGroup, samRGTags
+	fmtLav,NULL,false,false,NULL,NULL,	// outputFormat, outputInfo, userSetMarkMismatches, samMarkMismatches, readGroup, samRGTags
 	false,								// endComment
 	false,								// needTrueLengths
 	false,								// deGapifyOutput
 	NULL,NULL,NULL,						// dotplotFilename, dotplotFile, dotplotKeys
+	NULL,NULL,							// axtFilename, axtFile
+	NULL,NULL,							// mafFilename, mafFile
 
 	0,									// innerThreshold
 	NULL,								// innerSeed
@@ -447,6 +453,8 @@ static const int   defaultTwinsYes   = false;
 static const int   defaultTwinMinGap = 0;
 static const int   defaultTwinMaxGap = 10;
 
+static int   forceReportFilteredHsps     = false;
+
 static int   dbgShowMatrix               = false;
 static int   dbgDumpTargetSequence       = false;
 static int   dbgDumpQuerySequence        = false;
@@ -470,6 +478,8 @@ static char* dbgQueryProgressPrefix      = "";
 static int   dbgTargetProgress           = 0;
 static char* dbgTargetProgressPrefix     = "";
 #endif // allowSeveralTargets
+static int   dbgSeedHitProgress          = 0;
+static int   dbgFilterProgress           = 0;
 static int   dbgReportFinish             = false;
 
 #define innerWordSize	7				// word size for inner alignment seed
@@ -481,6 +491,10 @@ static const float defaultBallScoreFactor = 0.75;
 //	Whenever the process will go beyond just finding gap-free extensions, the
 //	segments that will become anchors (e.g. HSPs) are collected in this table
 //	instead of being written to the console.
+// $$$ Consider adding an --allocate:segtable=<bytes> option so the user can
+// $$$ .. modify numDefaultAnchors. We'd need to be able to convert <bytes> to
+// $$$ .. the number of anchors, by inverting segtable_bytes() which is
+// $$$ .. currently defined in segment.c
 
 #define numDefaultAnchors 4000
 
@@ -585,7 +599,7 @@ static void      remove_interval_seeds   (unspos b, unspos e, void* info);
 static u32       report_hsps             (void* info,
                                           unspos pos1, unspos pos2, unspos length,
                                           score s);
-static u32       collect_filtered_hsps   (void* info,
+static u32       report_filtered_hsps    (void* info,
                                           unspos pos1, unspos pos2, unspos length,
                                           score s);
 static u32       collect_hsps            (void* info,
@@ -597,7 +611,8 @@ static void      all_options             (void);
 static void      file_options            (void);
 static void      format_options          (void);
 static void      shortcuts               (void);
-static void      show_scoring_defaults   (FILE* f, int andExit);
+static void      show_scoring_defaults   (FILE* f, int outputFormat, int andExit);
+static void      show_scoring_defaults_core (FILE* f, int outputFormat, int andExit);
 static void      expander_options        (char* header, char* prefix);
 static void      chastise                (const char* format, ...);
 static void      parse_options           (int argc, char** argv,
@@ -712,11 +727,11 @@ int main
 	if (showDefaults)
 		{
 		if (showDefaultsExit)
-			show_scoring_defaults(helpout, /*andExit*/ true);	// (does not return)
+			show_scoring_defaults(helpout, fmtUnspecified, /*andExit*/ true);	// (does not return)
 		else if (showDefaultsStderr)
-			show_scoring_defaults(stderr,  /*andExit*/ false);
+			show_scoring_defaults(stderr,  fmtUnspecified, /*andExit*/ false);
 		else
-			show_scoring_defaults(stdout,  /*andExit*/ false);
+			show_scoring_defaults(stdout,  fmtUnspecified, /*andExit*/ false);
 		}
 
 	// open stats file
@@ -750,6 +765,13 @@ int main
 	// query) immediately, rather than wasting what might turn out to be a lot
 	// of processing time.
 	//////////
+
+	if (maxSequenceIndex > 32)   // (this is a proxy for any build for more than 2^32)
+		{
+		fprintf (stderr, "WARNING. vvvvvvvvvv\n");
+		fprintf (stderr, "WARNING. lastz_40 is an experimental build, and has NOT been rigorously tested\n");
+		fprintf (stderr, "WARNING. ^^^^^^^^^^\n");
+		}
 
 	startClock = clock();
 
@@ -1442,6 +1464,17 @@ next_target:
 		else if (query->chore.num == 1) numQueries++;
 		numChores++;
 
+		// the following warning is for users that are using lastz_40 outisde
+		// its intended use case; that use case is to align many short queries,
+		// such as genes, to a larger-than-4G genome
+		if ((maxSequenceIndex > 32)   // (this is a proxy for any build for more than 2^32)
+		 && (query->len > lz40QueryLengthLimit))
+			{
+			fprintf (stderr, "WARNING. %s exceeds the longest query expected for lastz_40 (%s > %s)\n",
+			                 query->shortHeader, commatize(query->len), commatize(lz40QueryLengthLimit));
+			fprintf (stderr, "........ performance (w.r.t. runtime or memory use) might be poor.\n");
+			}
+
 		if (query->len == 0)
 			{
 			report_progress (target, query,
@@ -1919,6 +1952,10 @@ show_stats_and_clean_up:
 	free_if_valid        ("lz.dotplotFilename",    lzParams.dotplotFilename);    lzParams.dotplotFilename    = NULL;
 	fclose_if_valid      (lzParams.dotplotFile);                                 lzParams.dotplotFile        = NULL;
 	free_if_valid        ("lz.dotplotKeys",        lzParams.dotplotKeys);        lzParams.dotplotKeys        = NULL;
+	free_if_valid        ("lz.axtFilename",        lzParams.axtFilename);        lzParams.axtFilename        = NULL;
+	fclose_if_valid      (lzParams.axtFile);                                     lzParams.axtFile            = NULL;
+	free_if_valid        ("lz.mafFilename",        lzParams.mafFilename);        lzParams.mafFilename        = NULL;
+	fclose_if_valid      (lzParams.mafFile);                                     lzParams.mafFile            = NULL;
 	free_if_valid        ("lz.seq1Filename",       lzParams.seq1Filename);       lzParams.seq1Filename       = NULL;
 	free_sequence        (lzParams.seq1);                                        lzParams.seq1               = NULL;
 	if (freeTargetRev)
@@ -2806,9 +2843,14 @@ void set_up_hit_processor
 	  && (dbgShowHspCountsMin == (u32)-1)))
 		hpInfo->reporter = report_hsps;
 
-	if ((params->hspImmediate) && (!params->gappedExtend))
+	if (forceReportFilteredHsps)
 		{
-		hpInfo->reporter                  = collect_filtered_hsps;
+		hpInfo->reporter                  = report_filtered_hsps;
+		hpInfo->reporterInfo              = NULL;
+		}
+	else if ((params->hspImmediate) && (!params->gappedExtend))
+		{
+		hpInfo->reporter                  = report_filtered_hsps;
 		hpInfo->reporterInfo              = NULL;
 		}
 	else if ((params->hspImmediate) && (params->gappedExtend))
@@ -2910,25 +2952,25 @@ void set_up_hit_processor
 		}
 
 #ifdef snoopHitProc
-	if      (*_hitProc == process_for_plain_hit)        fprintf (stderr, "hitProc              == process_for_plain_hit (%p)\n",       *_hitProc);
-	else if (*_hitProc == process_for_recoverable_hit)  fprintf (stderr, "hitProc              == process_for_recoverable_hit (%p)\n", *_hitProc);
-	else if (*_hitProc == process_for_simple_hit)       fprintf (stderr, "hitProc              == process_for_simple_hit (%p)\n",      *_hitProc);
-	else if (*_hitProc == process_for_twin_hit)         fprintf (stderr, "hitProc              == process_for_twin_hit (%p)\n",        *_hitProc);
-	else                                                fprintf (stderr, "hitProc              == ??? (%p)\n",                         *_hitProc);
+	if      (*_hitProc == process_for_plain_hit)       fprintf (stderr, "hitProc              == process_for_plain_hit (%p)\n",       *_hitProc);
+	else if (*_hitProc == process_for_recoverable_hit) fprintf (stderr, "hitProc              == process_for_recoverable_hit (%p)\n", *_hitProc);
+	else if (*_hitProc == process_for_simple_hit)      fprintf (stderr, "hitProc              == process_for_simple_hit (%p)\n",      *_hitProc);
+	else if (*_hitProc == process_for_twin_hit)        fprintf (stderr, "hitProc              == process_for_twin_hit (%p)\n",        *_hitProc);
+	else                                               fprintf (stderr, "hitProc              == ??? (%p)\n",                         *_hitProc);
 
-	if      (*_hitProcInfo == &simpleInfo)              fprintf (stderr, "hitProcInfo          == simpleInfo (%p)\n",                  *_hitProcInfo);
-	else if (*_hitProcInfo == &twinInfo)                fprintf (stderr, "hitProcInfo          == twinInfo (%p)\n",                    *_hitProcInfo);
-	else                                                fprintf (stderr, "hitProcInfo          == ??? (%p)\n",                         *_hitProcInfo);
+	if      (*_hitProcInfo == &simpleInfo)             fprintf (stderr, "hitProcInfo          == simpleInfo (%p)\n",                  *_hitProcInfo);
+	else if (*_hitProcInfo == &twinInfo)               fprintf (stderr, "hitProcInfo          == twinInfo (%p)\n",                    *_hitProcInfo);
+	else                                               fprintf (stderr, "hitProcInfo          == ??? (%p)\n",                         *_hitProcInfo);
 
-	if      (hpInfo->reporter == collect_hsps)          fprintf (stderr, "hpInfo->reporter     == collect_hsps (%p)\n",                hpInfo->reporter);
-	else if (hpInfo->reporter == report_hsps)           fprintf (stderr, "hpInfo->reporter     == report_hsps (%p)\n",                 hpInfo->reporter);
-	else if (hpInfo->reporter == collect_filtered_hsps) fprintf (stderr, "hpInfo->reporter     == collect_filtered_hsps (%p)\n",       hpInfo->reporter);
-	else if (hpInfo->reporter == gappily_extend_hsps)   fprintf (stderr, "hpInfo->reporter     == gappily_extend_hsps (%p)\n",         hpInfo->reporter);
-	else                                                fprintf (stderr, "hpInfo->reporter     == ??? (%p)\n",                         hpInfo->reporter);
+	if      (hpInfo->reporter == collect_hsps)         fprintf (stderr, "hpInfo->reporter     == collect_hsps (%p)\n",                hpInfo->reporter);
+	else if (hpInfo->reporter == report_hsps)          fprintf (stderr, "hpInfo->reporter     == report_hsps (%p)\n",                 hpInfo->reporter);
+	else if (hpInfo->reporter == report_filtered_hsps) fprintf (stderr, "hpInfo->reporter     == report_filtered_hsps (%p)\n",        hpInfo->reporter);
+	else if (hpInfo->reporter == gappily_extend_hsps)  fprintf (stderr, "hpInfo->reporter     == gappily_extend_hsps (%p)\n",         hpInfo->reporter);
+	else                                               fprintf (stderr, "hpInfo->reporter     == ??? (%p)\n",                         hpInfo->reporter);
 
-	if      (hpInfo->reporterInfo == &gappilyInfo)      fprintf (stderr, "hpInfo->reporterInfo == gappily_extend_hsps (%p)\n",         hpInfo->reporterInfo);
-	else if (hpInfo->reporterInfo == NULL)              fprintf (stderr, "hpInfo->reporterInfo == NULL (%p)\n",                        hpInfo->reporterInfo);
-	else                                                fprintf (stderr, "hpInfo->reporterInfo == ??? (%p)\n",                         hpInfo->reporterInfo);
+	if      (hpInfo->reporterInfo == &gappilyInfo)     fprintf (stderr, "hpInfo->reporterInfo == gappily_extend_hsps (%p)\n",         hpInfo->reporterInfo);
+	else if (hpInfo->reporterInfo == NULL)             fprintf (stderr, "hpInfo->reporterInfo == NULL (%p)\n",                        hpInfo->reporterInfo);
+	else                                               fprintf (stderr, "hpInfo->reporterInfo == ??? (%p)\n",                         hpInfo->reporterInfo);
 #endif // snoopHitProc
 	}
 
@@ -3042,14 +3084,18 @@ int start_one_strand
 		                         hitProc, hitProcInfo);
 	else
 		{
-#ifndef densityFiltering // === density filtering DISabled
+#if ((!defined densityFiltering) && (defined forbidBandWidth))
+		// === density filtering DISabled  and  band width DISabled
 		seed_hit_search (target, targPositions,
 		                 query, 0, query->len, currParams->selfCompare,
 		                 currParams->upperCharToBits, currParams->hitSeed,
 		                 searchLimit,
 		                 (currParams->searchLimitWarn)? currParams->searchLimit : 0,
 		                 hitProc, hitProcInfo);
-#else                    // === density filtering ENabled
+#endif // not densityFiltering and forbidBandWidth
+
+#if ((defined densityFiltering) && (defined forbidBandWidth))
+		// === density filtering ENabled  and  band width DISabled
 		basesHit = seed_hit_search (target, targPositions,
 		                            query, 0, query->len, currParams->selfCompare,
 		                            currParams->upperCharToBits, currParams->hitSeed,
@@ -3059,7 +3105,32 @@ int start_one_strand
 		                            hitProc, hitProcInfo);
 		if (basesHit == u64max) // maxDensity has been exceeded (u64max is used
 			goto abort;			// .. as a special value indicating this)
-#endif // densityFiltering
+#endif // densityFiltering and forbidBandWidth
+
+#if ((!defined densityFiltering) && (!defined forbidBandWidth))
+		// === density filtering DISabled  and  band width ENabled
+		seed_hit_search (target, targPositions,
+		                 query, 0, query->len, currParams->selfCompare,
+		                 currParams->upperCharToBits, currParams->hitSeed,
+		                 searchLimit,
+		                 (currParams->searchLimitWarn)? currParams->searchLimit : 0,
+		                 currParams->bandWidth,
+		                 hitProc, hitProcInfo);
+#endif // not densityFiltering and not forbidBandWidth
+
+#if ((defined densityFiltering) && (!defined forbidBandWidth))
+		// === density filtering ENabled  and  band width ENabled
+		basesHit = seed_hit_search (target, targPositions,
+		                            query, 0, query->len, currParams->selfCompare,
+		                            currParams->upperCharToBits, currParams->hitSeed,
+		                            searchLimit,
+		                            (currParams->searchLimitWarn)? currParams->searchLimit : 0,
+		                            currParams->maxDensity,
+		                            currParams->bandWidth,
+		                            hitProc, hitProcInfo);
+		if (basesHit == u64max) // maxDensity has been exceeded (u64max is used
+			goto abort;			// .. as a special value indicating this)
+#endif // densityFiltering and not forbidBandWidth
 		}
 
 	// see if we got too many HSPs/anchors/segments
@@ -3751,12 +3822,29 @@ static u32 report_hsps
 	unspos	length,
 	score	s)
 	{
-	static u64	hspIdCounter;
-	unspos	s1, s2;
+	static u64 hspIdCounter;
+	unspos s1, s2;
+
+	hspIdCounter++;
+
+	if ((dbgSeedHitProgress != 0) && (hspIdCounter % dbgSeedHitProgress == 1))
+		{
+		char* name2 = NULL;
+
+		if (currParams->seq2->partition.p == NULL) // sequence 2 is not partitioned
+			name2 = (currParams->seq1->useFullNames)? currParams->seq2->header
+													: currParams->seq2->shortHeader;
+		if ((name2 == NULL) || (name2[0] == 0)) name2 = "seq2";
+
+		fprintf (stderr, "hspsearch: %s HSPs / %s.%s.pos=%s (%.2f%%)\n",
+		                 ucommatize(hspIdCounter),
+		                 name2,currParams->seq2->revCompFlags==rcf_forward?"fwd":"rev",ucommatize(pos2),
+		                 (100.0*pos2 / currParams->seq2->len));
+		}
 
 	// report this hit/HSP
 
-	print_match (pos1-length, pos2-length, length, s, ++hspIdCounter);
+	print_match (pos1-length, pos2-length, length, s, hspIdCounter);
 
 	if (dbgShowHsps)
 		{
@@ -3801,6 +3889,98 @@ static u32 report_hsps
 //----------
 // [[-- a seed hit reporter function --]]
 //
+// report_filtered_hsps--
+//	Report a seed hit or HSP (i.e. just write it to output), so long as it
+//	satisfies the current filtering criteria.
+//
+// Arguments and Return value: (see seed_search.h)
+//
+//----------
+//
+// Note: in earlier versions, this was collect_filtered_hsps(), but that was a
+//       misnomer.
+//
+//----------
+
+static u32 report_filtered_hsps
+   (arg_dont_complain(void* info),
+	unspos	pos1,
+	unspos	pos2,
+	unspos	length,
+	score	s)
+	{
+	static u64 numHsps = 0;
+	static u64 numRejected = 0;
+	unspos	startPos1 = pos1 - length;
+	unspos	startPos2 = pos2 - length;
+	segment	seg;
+
+	numHsps++;
+
+	if ((dbgFilterProgress != 0) && (numHsps % dbgFilterProgress == 1))
+		{
+		char* name2 = NULL;
+
+		if (currParams->seq2->partition.p == NULL) // sequence 2 is not partitioned
+			name2 = (currParams->seq1->useFullNames)? currParams->seq2->header
+													: currParams->seq2->shortHeader;
+		if ((name2 == NULL) || (name2[0] == 0)) name2 = "seq2";
+
+		fprintf (stderr, "filter: passed %s HSPs / rejected %s (%.2f%%) / %s.%s.pos=%s (%.2f%%)\n",
+		                 ucommatize(numHsps-numRejected), ucommatize(numRejected),
+		                 (100.0*numRejected) / numHsps,
+		                 name2,currParams->seq2->revCompFlags==rcf_forward?"fwd":"rev",ucommatize(pos2),
+		                 (100.0*pos2 / currParams->seq2->len));
+		}
+
+	// filter HSP by identity and/or coverage
+
+	if ((currParams->minIdentity > 0) || (currParams->maxIdentity < 1))
+		{
+		if (filter_segment_by_identity (currParams->seq1, startPos1,
+		                                currParams->seq2, startPos2, length,
+		                                currParams->minIdentity,
+		                                currParams->maxIdentity))
+			goto rejected;
+		}
+
+	if ((currParams->minCoverage > 0) || (currParams->maxCoverage < 1))
+		{
+		seg.pos1   = startPos1;
+		seg.pos2   = startPos2;
+		seg.length = length;
+		if (filter_segment_by_coverage (currParams->seq1, currParams->seq2, &seg,
+		                                currParams->minCoverage,
+		                                currParams->maxCoverage))
+			goto rejected;
+		}
+
+	if (currParams->minMatchCount > 0)
+		{
+		if (filter_segment_by_match_count (currParams->seq1, startPos1,
+		                                   currParams->seq2, startPos2, length,
+		                                   currParams->minMatchCount))
+			goto rejected;
+		}
+
+	if (currParams->maxMismatchCount >= 0)
+		{
+		if (filter_segment_by_mismatch_count (currParams->seq1, startPos1,
+		                                      currParams->seq2, startPos2, length,
+		                                      currParams->minMatchCount))
+			goto rejected;
+		}
+
+	return report_hsps (info, pos1, pos2, length, s);
+
+rejected:
+	numRejected++;
+	return 0;
+	}
+
+//----------
+// [[-- a seed hit reporter function --]]
+//
 // collect_hsps--
 //	Collect a seed hit or HSP.
 //
@@ -3815,8 +3995,26 @@ static u32 collect_hsps
 	unspos	length,
 	score	s)
 	{
+	static u64 numHsps = 0;
 	unspos	s1, s2;
 	int		reportAnchor = false;
+
+	numHsps++;
+
+	if ((dbgSeedHitProgress != 0) && (numHsps % dbgSeedHitProgress == 1))
+		{
+		char* name2 = NULL;
+
+		if (currParams->seq2->partition.p == NULL) // sequence 2 is not partitioned
+			name2 = (currParams->seq1->useFullNames)? currParams->seq2->header
+													: currParams->seq2->shortHeader;
+		if ((name2 == NULL) || (name2[0] == 0)) name2 = "seq2";
+
+		fprintf (stderr, "hspsearch: %s HSPs / %s.%s.pos=%s (%.2f%%)\n",
+		                 ucommatize(numHsps),
+		                 name2,currParams->seq2->revCompFlags==rcf_forward?"fwd":"rev",ucommatize(pos2),
+		                 (100.0*pos2 / currParams->seq2->len));
+		}
 
 	// add this hit/HSP to the list of anchors;  note that we use the strand
 	// (actually the rcf value) as the id field, so that if we happen to be
@@ -3887,72 +4085,6 @@ static u32 collect_hsps
 		}
 
 	return 2*length;
-	}
-
-//----------
-// [[-- a seed hit reporter function --]]
-//
-// collect_filtered_hsps--
-//	Collect a seed hit or HSP, so long as it satisfies the current filtering
-//	criteria.
-//
-// Arguments and Return value: (see seed_search.h)
-//
-//----------
-
-static u32 collect_filtered_hsps
-   (arg_dont_complain(void* info),
-	unspos	pos1,
-	unspos	pos2,
-	unspos	length,
-	score	s)
-	{
-	unspos	startPos1 = pos1 - length;
-	unspos	startPos2 = pos2 - length;
-	segment	seg;
-
-	// filter HSP by identity and/or coverage
-
-	if ((currParams->minIdentity > 0) || (currParams->maxIdentity < 1))
-		{
-		if (filter_segment_by_identity (currParams->seq1, startPos1,
-		                                currParams->seq2, startPos2, length,
-		                                currParams->minIdentity,
-		                                currParams->maxIdentity))
-			goto filtered;
-		}
-
-	if ((currParams->minCoverage > 0) || (currParams->maxCoverage < 1))
-		{
-		seg.pos1   = startPos1;
-		seg.pos2   = startPos2;
-		seg.length = length;
-		if (filter_segment_by_coverage (currParams->seq1, currParams->seq2, &seg,
-		                                currParams->minCoverage,
-		                                currParams->maxCoverage))
-			goto filtered;
-		}
-
-	if (currParams->minMatchCount > 0)
-		{
-		if (filter_segment_by_match_count (currParams->seq1, startPos1,
-		                                   currParams->seq2, startPos2, length,
-		                                   currParams->minMatchCount))
-			goto filtered;
-		}
-
-	if (currParams->maxMismatchCount >= 0)
-		{
-		if (filter_segment_by_mismatch_count (currParams->seq1, startPos1,
-		                                      currParams->seq2, startPos2, length,
-		                                      currParams->minMatchCount))
-			goto filtered;
-		}
-
-	return report_hsps (info, pos1, pos2, length, s);
-
-filtered:
-	return 0;
 	}
 
 //----------
@@ -4636,6 +4768,8 @@ static void all_options (void)
 //	fprintf (helpout, "  --markend              Write a comment at the end of the output file\n");
 
 	fprintf (helpout, "  --rdotplot=<file>      create an output file suitable for plotting in R.\n");
+	fprintf (helpout, "  --axt=<file>           create an output file in AXT format.\n");
+	fprintf (helpout, "  --maf=<file>           create an output file in MAF format.\n");
 
 //	fprintf (helpout, "  --verbosity=<level>    set info level (0 is minimum, 10 is everything)\n");
 //	fprintf (helpout, "                         (default is %d)\n",
@@ -4757,6 +4891,9 @@ static void format_options (void)
 	fprintf (helpout, "    in the form of comments.  The exact content of these comment lines may\n");
 	fprintf (helpout, "    change in future releases of lastz.\n");
 	fprintf (helpout, "\n");
+	fprintf (helpout, "    The separate option --axt=<file> can be used to create a AXT format file\n");
+	fprintf (helpout, "    at the same time as creating alignment output in another format.\n");
+	fprintf (helpout, "\n");
 	fprintf (helpout, "MAF\n");
 	fprintf (helpout, "    MAF format is a multiple alignment format.  As of Jan/2009, a spec for MAF\n");
 	fprintf (helpout, "    files can be found at\n");
@@ -4771,6 +4908,9 @@ static void format_options (void)
 	fprintf (helpout, "\n");
 	fprintf (helpout, "    The option --format=maf- inhibits the maf header and any comments.  This\n");
 	fprintf (helpout, "    makes it suitable for catenating output from multiple runs.\n");
+	fprintf (helpout, "\n");
+	fprintf (helpout, "    The separate option --maf=<file> can be used to create a MAF format file\n");
+	fprintf (helpout, "    at the same time as creating alignment output in another format.\n");
 	fprintf (helpout, "\n");
 	fprintf (helpout, "SAM\n");
 	fprintf (helpout, "    SAM format is a pairwise alignment format used primarily for short-read\n");
@@ -4980,9 +5120,27 @@ static void shortcuts (void)
 	}
 
 
-static void show_scoring_defaults (FILE* f, int andExit)
+static void show_scoring_defaults
+   (FILE*		f,
+	int 		_outputFormat,
+	int			andExit)
+	{
+	show_scoring_defaults_core (f, _outputFormat, andExit);
+
+	if (currParams->axtFile != NULL)
+		show_scoring_defaults_core (currParams->axtFile, fmtAxt, /*andExit*/ false);
+
+	if (currParams->mafFile != NULL)
+		show_scoring_defaults_core (currParams->mafFile, fmtMaf, /*andExit*/ false);
+	}
+
+static void show_scoring_defaults_core
+   (FILE*		f,
+	int 		_outputFormat,
+	int			andExit)
 	{
 	// nota bene:  an older, similar routine is print_params()
+	int			outputFormat;
 	char*		name1   = currParams->seq1Filename;
 	char*		name2   = currParams->seq2Filename;
 	char*		args    = currParams->args;
@@ -4994,6 +5152,8 @@ static void show_scoring_defaults (FILE* f, int andExit)
 	char		_commentPrefix[2];
 	char		buffer[501];
 
+	outputFormat = (_outputFormat==fmtUnspecified)? currParams->outputFormat : _outputFormat;
+
 	if (name1 == NULL) name1 = "(no name)";
 	if (name2 == NULL) name2 = "(no name)";
 	if (args  == NULL) args  = "(none)";
@@ -5002,7 +5162,7 @@ static void show_scoring_defaults (FILE* f, int andExit)
 		{ _commentPrefix[0] = 0;  commentPrefix = _commentPrefix; }
 	else
 		{
-		commentPrefix = print_comment_open ();
+		commentPrefix = print_comment_open (f, outputFormat);
 		if (commentPrefix == NULL)
 			{ _commentPrefix[0] = 0;  commentPrefix = _commentPrefix; }
 		}
@@ -5092,7 +5252,7 @@ static void show_scoring_defaults (FILE* f, int andExit)
 	if (andExit)
 		exit (EXIT_FAILURE);
 	else
-		print_comment_close ();
+		print_comment_close (f, outputFormat);
 	}
 
 
@@ -5177,7 +5337,6 @@ char*	firstSpecialSub;
 score	specialSubScores[4][4];
 int		formatIsSegments;
 int		formatIsDotPlot;
-
 
 static void parse_options_loop   (int argc, char** argv,
                                   control* lzParams, control* izParams,
@@ -6293,6 +6452,14 @@ static void parse_options_loop
 			}
 
 		// --allocate:traceback=<bytes> or --traceback=<bytes> or m=<bytes>
+		//
+		// ~~~ github issue 52 ~~~ 
+		// though tracebackMem is a u32, this must *not* exceed the maximum
+		// signed int; this is because some code in gapped_extend.c incorrectly
+		// treats tracebackMem, and derived variables, as if they were ints; as
+		// of this writing (Oct/2022) it is more prudent to limit tracebackMem
+		// to INT_MAX than to risk breaking the core code in gapped_extend.c;
+		// see notes in gapped_extend.c marked "github issue 52"
 
 		if ((strcmp_prefix (arg, "--allocate:traceback=") == 0)
 		 || (strcmp_prefix (arg, "--alloc:traceback="   ) == 0)
@@ -6301,7 +6468,15 @@ static void parse_options_loop
 		 || (strcmp_prefix (arg, "--traceback="         ) == 0)
 		 || (strcmp_prefix (arg, "m="                   ) == 0))
 			{
-			lzParams->tracebackMem = string_to_unitized_int (argStr, false /*units of 1,024*/);
+			int64 tracebackMemArg;
+			tracebackMemArg = string_to_unitized_int64 (argStr, false /*units of 1,024*/);
+			if (tracebackMemArg < 0)
+				chastise ("--allocate:traceback cannot be negative (%s)\n",arg);
+			if (tracebackMemArg == ((u32) INT_MAX)+1)
+				tracebackMemArg = INT_MAX; // special case so that "2G" is accepted
+			else if (tracebackMemArg > INT_MAX)
+				chastise ("--allocate:traceback cannot be more than 2G (%s)\n",arg);
+			lzParams->tracebackMem = (u32) tracebackMemArg;
 			goto next_arg;
 			}
 
@@ -6686,7 +6861,7 @@ static void parse_options_loop
 				lzParams->minMatchCountRatio = pct_string_to_double (argStr);
 			else
 				{
-				tempInt = string_to_int (argStr);
+				tempInt = string_to_unitized_int (argStr, true /*units of 1,000*/);
 				if (tempInt <= 0)
 					suicidef ("--filter=nmatch must be positive");
 				lzParams->minMatchCount = tempInt;
@@ -6699,13 +6874,13 @@ static void parse_options_loop
 
 		if (strcmp_prefix (arg, "--filter=nmismatch:..") == 0)
 			{
-			tempInt = string_to_int (strstr(arg,":..")+3);
+			tempInt = string_to_unitized_int (strstr(arg,":..")+3, true /*units of 1,000*/);
 			goto set_max_mismatch_count;
 			}
 
 		if (strcmp_prefix (arg, "--filter=nmismatch:0..") == 0)
 			{
-			tempInt = string_to_int (strstr(arg,":0..")+4);
+			tempInt = string_to_unitized_int (strstr(arg,":0..")+4, true /*units of 1,000*/);
 		set_max_mismatch_count:
 			if (tempInt < 0)
 				suicidef ("--filter=nmismatch can't be negative");
@@ -6869,6 +7044,19 @@ static void parse_options_loop
 			goto next_arg;
 			}
 
+		// --axt=<file>
+
+		if ((strcmp_prefix (arg, "--axt=") == 0)
+		 || (strcmp_prefix (arg, "--AXT=") == 0))
+			{
+			if (lzParams->axtFilename != NULL)
+				goto duplicated_option;
+			lzParams->axtFilename = copy_string (argStr);
+			goto next_arg;
+			}
+
+		// --format=maf and variants
+
 		if ((strcmp (arg, "--format=maf") == 0)
 		 || (strcmp (arg, "--format=MAF") == 0)
 		 || (strcmp (arg, "--maf")        == 0)
@@ -6948,12 +7136,54 @@ static void parse_options_loop
 			goto next_arg;
 			}
 
+		// --maf=<file>
+
+		if ((strcmp_prefix (arg, "--maf=") == 0)
+		 || (strcmp_prefix (arg, "--MAF=") == 0))
+			{
+			if (lzParams->mafFilename != NULL)
+				goto duplicated_option;
+			lzParams->mafFilename = copy_string (argStr);
+			goto next_arg;
+			}
+
+		// --format=sam and variants
+		//
+		// that the intended behavior of --mark:mismatches (a.k.a. --eqx) is
+		// that the user can specify it separately from format=sam, either
+		// before or after on the command line; OR she can add "+eqx" to the
+		// format=sam arg; after parsing, when we sanity check the options, we
+		// will set lzParams->samMarkMismatches to true if she used
+		// --mark:mismatches; nb: the abbreviation "--eqx" was chosen to match
+		// the corresponding option in minimap2
+
+		if ((strcmp (arg, "--mark:mismatches") == 0)	// (only valid is SAM format is specified)
+		 || (strcmp (arg, "--mark:eqx")        == 0)
+		 || (strcmp (arg, "--mark:EQX")        == 0)
+		 || (strcmp (arg, "--eqx")             == 0)
+		 || (strcmp (arg, "--EQX")             == 0))
+			{
+			lzParams->userSetMarkMismatches = true;
+			goto next_arg;
+			}
+
 		if ((strcmp (arg, "--format=softsam") == 0)
 		 || (strcmp (arg, "--format=SOFTSAM") == 0)
 		 || (strcmp (arg, "--softsam")        == 0)
 		 || (strcmp (arg, "--SOFTSAM")        == 0))
 			{
-			lzParams->outputFormat = fmtSoftSam;
+			lzParams->outputFormat      = fmtSoftSam;
+			lzParams->samMarkMismatches = false;
+			goto next_arg;
+			}
+
+		if ((strcmp (arg, "--format=softsam+eqx") == 0)
+		 || (strcmp (arg, "--format=SOFTSAM+EQX") == 0)
+		 || (strcmp (arg, "--softsam+eqx")        == 0)
+		 || (strcmp (arg, "--SOFTSAM+EQX")        == 0))
+			{
+			lzParams->outputFormat      = fmtSoftSam;
+			lzParams->samMarkMismatches = true;
 			goto next_arg;
 			}
 
@@ -6962,7 +7192,18 @@ static void parse_options_loop
 		 || (strcmp (arg, "--softsam-")        == 0)
 		 || (strcmp (arg, "--SOFTSAM-")        == 0))
 			{
-			lzParams->outputFormat = fmtSoftSamNoHeader;
+			lzParams->outputFormat      = fmtSoftSamNoHeader;
+			lzParams->samMarkMismatches = false;
+			goto next_arg;
+			}
+
+		if ((strcmp (arg, "--format=softsam+eqx-") == 0)
+		 || (strcmp (arg, "--format=SOFTSAM+EQX-") == 0)
+		 || (strcmp (arg, "--softsam+eqx-")        == 0)
+		 || (strcmp (arg, "--SOFTSAM+EQX-")        == 0))
+			{
+			lzParams->outputFormat      = fmtSoftSamNoHeader;
+			lzParams->samMarkMismatches = true;
 			goto next_arg;
 			}
 
@@ -6971,7 +7212,18 @@ static void parse_options_loop
 		 || (strcmp (arg, "--sam")        == 0)
 		 || (strcmp (arg, "--SAM")        == 0))
 			{
-			lzParams->outputFormat = fmtHardSam;
+			lzParams->outputFormat      = fmtHardSam;
+			lzParams->samMarkMismatches = false;
+			goto next_arg;
+			}
+
+		if ((strcmp (arg, "--format=sam+eqx") == 0)
+		 || (strcmp (arg, "--format=SAM+EQX") == 0)
+		 || (strcmp (arg, "--sam+eqx")        == 0)
+		 || (strcmp (arg, "--SAM+EQX")        == 0))
+			{
+			lzParams->outputFormat      = fmtHardSam;
+			lzParams->samMarkMismatches = true;
 			goto next_arg;
 			}
 
@@ -6980,7 +7232,18 @@ static void parse_options_loop
 		 || (strcmp (arg, "--sam-")        == 0)
 		 || (strcmp (arg, "--SAM-")        == 0))
 			{
-			lzParams->outputFormat = fmtHardSamNoHeader;
+			lzParams->outputFormat      = fmtHardSamNoHeader;
+			lzParams->samMarkMismatches = false;
+			goto next_arg;
+			}
+
+		if ((strcmp (arg, "--format=sam+eqx-") == 0)
+		 || (strcmp (arg, "--format=SAM+EQX-") == 0)
+		 || (strcmp (arg, "--sam+eqx-")        == 0)
+		 || (strcmp (arg, "--SAM+EQX-")        == 0))
+			{
+			lzParams->outputFormat      = fmtHardSamNoHeader;
+			lzParams->samMarkMismatches = true;
 			goto next_arg;
 			}
 
@@ -7550,6 +7813,24 @@ static void parse_options_loop
 		if (strcmp (arg, "--notruncationreport") == 0)
 			{ gapped_extend_inhibitTruncationReport = true;  goto next_arg; }
 
+		// --band=<width>
+
+		if ((strcmp_prefix (arg, "--band=") == 0) \
+		 || (strcmp_prefix (arg, "--bandwidth=") == 0))
+			{
+#ifndef forbidBandWidth
+			tempInt = string_to_unitized_int (strchr(arg,'=')+1, true /*units of 1,000*/);
+			if (tempInt <= 0)
+				suicidef ("--band width must be positive");
+			else if (tempInt > maxBandWidth)
+				suicidef ("--band width (%s) cannot be more than %s",commatize(tempInt),commatize(maxBandWidth));
+			lzParams->bandWidth = (u32) tempInt;
+#else // forbidBandWidth
+			suicidef ("--band[width] is not implemented in this build of lastz");
+#endif // forbidBandWidth
+			goto next_arg;
+			}
+
 		// --version and (unadvertised) --version:noerror
 
 		if (strcmp (arg, "--version:noerror") == 0)
@@ -7632,7 +7913,7 @@ static void parse_options_loop
 		 || (strcmp (arg, "--help=blastz") == 0))
 			{ shortcuts(); }
 
-		// --help=defaults, --show=defaults, and (unadvertized) --show=defaults:stderr
+		// --help=defaults, --show=defaults, and (unadvertised) --show=defaults:stderr
 
 		if (strcmp (arg, "--help=defaults") == 0)
 			{
@@ -7664,10 +7945,17 @@ static void parse_options_loop
 		 || (strcmp (arg, "--help=yasra") == 0))
 			{ expander_options ("yasra-specific options", "--yasra"); }
 
-		// --tryout=<what> (unadvertised)
+		// --force:<what> (unadvertised)
+
+		if ((strcmp (arg, "--force:reportfilteredhsps") == 0)
+		 || (strcmp (arg, "--force=reportfilteredhsps") == 0))
+			{ forceReportFilteredHsps = true;  goto next_arg; }
+
+		// --tryout:<what> (unadvertised)
 
 #ifdef tryout
-		if (strcmp (arg, "--tryout=immediategapped") == 0)
+		if ((strcmp (arg, "--tryout:immediategapped") == 0)
+		 || (strcmp (arg, "--tryout=immediategapped") == 0))
 			{
 			lzParams->hspImmediate = true;
 			goto next_arg;
@@ -7782,12 +8070,17 @@ static void parse_options_loop
 			goto next_arg;
 			}
 
-		if ((strcmp_prefix (arg, "--debug=segmentprogress:")  == 0)
+		if ((strcmp_prefix (arg, "--progress:segments=")      == 0)
+		 || (strcmp_prefix (arg, "--progress:anchors=")       == 0)
+		 || (strcmp_prefix (arg, "--debug=segmentprogress:")  == 0)
 		 || (strcmp_prefix (arg, "--debug=segmentsprogress:") == 0)
 		 || (strcmp_prefix (arg, "--debug=anchorprogress:")   == 0)
 		 || (strcmp_prefix (arg, "--debug=anchorsprogress:")  == 0))
 			{
-			scan = strchr(argStr,':') + 1;
+			if (strcmp_prefix (arg, "--progress:") == 0)
+				scan = argStr;
+			else
+				scan = strchr(argStr,':') + 1;
 			dbgAnchorsProgress = string_to_unitized_int (scan, true /*units of 1,000*/);
 			if (dbgAnchorsProgress <= 0)
 				dbgAnchorsProgress = 0;
@@ -7930,6 +8223,22 @@ static void parse_options_loop
 		if (strcmp (arg, "--debug=progressprefix") == 0)
 			{ dbgQueryProgressPrefix = dbgTargetProgressPrefix = "==================== ";  goto next_arg; }
 #endif // allowSeveralTargets
+
+		if (strcmp_prefix (arg, "--progress:hspsearch=") == 0)
+			{
+			dbgSeedHitProgress = string_to_unitized_int (argStr, true /*units of 1,000*/);
+			if (dbgSeedHitProgress == 1)
+				chastise ("progress:hspsearch must be at least 2\n");  // because of the way modularity is tested
+			goto next_arg;
+			}
+
+		if (strcmp_prefix (arg, "--progress:filter=") == 0)
+			{
+			dbgFilterProgress = string_to_unitized_int (argStr, true /*units of 1,000*/);
+			if (dbgFilterProgress == 1)
+				chastise ("progress:filter must be at least 2\n");  // because of the way modularity is tested
+			goto next_arg;
+			}
 
 		if ((strcmp (arg, "--debug=converge") == 0)
 		 || (strcmp (arg, "--debug=convergence") == 0))
@@ -8225,11 +8534,40 @@ static void parse_options
 	else
 		lzParams->outputFile = fopen_or_die (lzParams->outputFilename, "wt");
 
-	if ((lzParams->dotplotFilename) && (formatIsDotPlot))
+	if ((lzParams->dotplotFilename != NULL) && (formatIsDotPlot))
 		suicidef ("--format=rdotplot can't be used with --rdotplot=<file>");
 
 	if (lzParams->dotplotFilename != NULL)
 		lzParams->dotplotFile = fopen_or_die (lzParams->dotplotFilename, "wt");
+
+	if ((lzParams->axtFilename != NULL)
+	 &&  ((lzParams->outputFormat == fmtAxt)
+	   || (lzParams->outputFormat == fmtAxtComment)
+	   || (lzParams->outputFormat == fmtAxtGeneral)))
+		suicidef ("--format=axt can't be used with --axt=<file>");
+
+	if (lzParams->axtFilename != NULL)
+		lzParams->axtFile = fopen_or_die (lzParams->axtFilename, "wt");
+
+	if ((lzParams->mafFilename != NULL)
+	 &&  ((lzParams->outputFormat == fmtMaf)
+	   || (lzParams->outputFormat == fmtMafComment)
+	   || (lzParams->outputFormat == fmtMafNoComment)))
+		suicidef ("--format=maf can't be used with --maf=<file>");
+
+	if (lzParams->mafFilename != NULL)
+		lzParams->mafFile = fopen_or_die (lzParams->mafFilename, "wt");
+
+	if (lzParams->userSetMarkMismatches)
+		{
+		if ((lzParams->outputFormat != fmtSoftSam)
+		 && (lzParams->outputFormat != fmtSoftSamNoHeader)
+		 && (lzParams->outputFormat != fmtHardSam)
+		 && (lzParams->outputFormat != fmtHardSamNoHeader))
+			suicidef ("--mark:mismatches or --eqx requires one of the SAM formats (e.g. --format=sam)");
+
+		lzParams->samMarkMismatches = true;
+		}
 
 	if (lzParams->readGroup != NULL)
 		{
@@ -8394,6 +8732,30 @@ static void parse_options
 		chastise ("--mirror can only be used with --self\n");
 	else
 		lzParams->mirrorHSP = lzParams->mirrorGapped = false;
+
+#ifndef forbidBandWidth
+	if (lzParams->bandWidth != 0)
+		{
+		if (!lzParams->selfCompare)
+			chastise ("--band=<width> requires --self\n");
+		if (lzParams->whichStrand != 0)
+			chastise ("--band=<width> requires --strand=plus\n");
+		if ((lzParams->targetIsQuantum) || (lzParams->queryIsQuantum))
+			chastise ("--band=<width> cannot be used with quantum DNA\n");
+		if (lzParams->inferScores)
+			chastise ("--band=<width> cannot be used with scoring inference\n");
+		if (lzParams->anchorsFilename != NULL)
+			{
+			// $$$ nota bene: to implement this would require a relatively
+			//     simple modification to read_segment_table(); however, since
+			//     the idea of --segments is to allow the user to use other
+			//     strategies to find HSPs/anchors, it seems reasonable to
+			//     expect her to restrict those to a band if that's what she
+			//     wants
+			fprintf (stderr, "WARNING. --band=<width> is ignored when --segments is specified\n");
+			}
+		}
+#endif // not forbidBandWidth
 
 	if (lzParams->readCapsule)
 		{
@@ -8560,6 +8922,14 @@ static void parse_options
 		if (haveInterpThreshold)
 			chastise ("--inner cannot be used with --writesegments\n");
 		lzParams->gappedExtend = false;
+		}
+
+	if (forceReportFilteredHsps)
+		{
+		if (lzParams->gappedExtend)
+			chastise ("-force:reportfilteredhsps can only be used with --nogapped\n");
+		if (lzParams->hspThreshold.t != 'S')   // (hsps are adaptive)
+			chastise ("-force:reportfilteredhsps cannot be used with an adaptive HSP threshold\n");
 		}
 
 	//////////
@@ -9335,9 +9705,8 @@ static void create_seed_structure
 			suicide ("bad capsule file (missing seed)");
 
 		numParts = (int) seedCapsule->numParts;
-		if (numParts > (int) (sizeof(shift)/sizeof(shift[0])))
-			suicidef ("internal error handling capsule file (numParts = %d)",
-			          numParts);
+		if ((numParts < 1) || (numParts > (int) (sizeof(shift)/sizeof(shift[0]))))
+			suicidef ("internal error handling capsule file (numParts = %d), is file corrupt?", numParts);
 
 		scan       = &seedCapsule->shift0;
 		mask       = &scan[numParts];
@@ -10051,21 +10420,21 @@ bad_step:
 static void print_options
    (void)
 	{
-	print_generic (currParams->outputFile,
+	print_generic (NULL,
 	               "seed=%s%s",
 	               seed_pattern(currParams->hitSeed),
 	               (currParams->hitSeed->withTrans == 0)?"":
 	               (currParams->hitSeed->withTrans == 1)?" w/transition"
 	                                                    :" w/2 transitions");
-	//print_generic (currParams->outputFile, "--hspthresh=" scoreFmtSimple, currParams->hspThreshold);
-	//print_generic (currParams->outputFile, "--gappedthresh=" scoreFmtSimple, currParams->gappedThreshold);
-	//print_generic (currParams->outputFile, "--xDrop=" scoreFmtSimple, currParams->xDrop);
-	//print_generic (currParams->outputFile, "--yDrop=" scoreFmtSimple, currParams->yDrop);
-	//print_generic (currParams->outputFile, "%s", (currParams->entropicHsp)? "--entropy" : "--noentropy");
-	//if (currParams->minMatches >= 0) print_generic (currParams->outputFile, 'z', "--filter=%d,%d", currParams->minMatches, currParams->maxTransversions);
-	//if (currParams->twinMinSpan > 0) print_generic (currParams->outputFile, "twins=%d..%d", currParams->twinMinSpan-2*currParams->hitSeed->length, currParams->twinMaxSpan-2*currParams->hitSeed->length);
-	//                        else print_generic (currParams->outputFile, "notwins");
-	print_generic (currParams->outputFile, "step=%u", currParams->step);
+	//print_generic (NULL, "--hspthresh=" scoreFmtSimple, currParams->hspThreshold);
+	//print_generic (NULL, "--gappedthresh=" scoreFmtSimple, currParams->gappedThreshold);
+	//print_generic (NULL, "--xDrop=" scoreFmtSimple, currParams->xDrop);
+	//print_generic (NULL, "--yDrop=" scoreFmtSimple, currParams->yDrop);
+	//print_generic (NULL, "%s", (currParams->entropicHsp)? "--entropy" : "--noentropy");
+	//if (currParams->minMatches >= 0) print_generic (NULL, 'z', "--filter=%d,%d", currParams->minMatches, currParams->maxTransversions);
+	//if (currParams->twinMinSpan > 0) print_generic (NULL, "twins=%d..%d", currParams->twinMinSpan-2*currParams->hitSeed->length, currParams->twinMaxSpan-2*currParams->hitSeed->length);
+	//                        else print_generic (NULL, "notwins");
+	print_generic (NULL, "step=%u", currParams->step);
 	}
 
 //----------

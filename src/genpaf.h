@@ -100,6 +100,8 @@ enum
 	genpafCigarXLower      = '^',
 	genpafCigarX1          = '"',
 	genpafCigarX1Lower     = '\'',
+	genpafEntropy1         = 'H',
+	genpafEntropy2         = 'h',
 	genpafHspId            = '(',
 	genpafPositionHash     = '4',
 	genpafAlignmentHash    = '5',
@@ -115,7 +117,7 @@ enum
 #define genpafStandardKeys      "#NDSZEndszeIC"
 #define genpafMappingKeys       "NZEnd>,IC^"
 #define genpafSegmentKeys       "NBEnbed#"
-#define genpafBlastKeys         "nNmWvybeQR%$"
+#define genpafBlastKeys         "nNmWvy<,QR%$"  // was, erroneously, "nNmWvybeQR%$"
 #define genpafRDotplotKeys      "02!13!XX"
 #define genpafRDotplotScoreKeys "02#!13#!XXX"
 #define genpafPafWfMashKeys     "ns>,dNSZEuW{|}"
@@ -205,6 +207,8 @@ global stringtokey genpafName[] =
 	{ "number",         genpafAlignmentNum     },
 	{ "znumber",        genpafAlignmentNumZero },
 	{ "chore",          genpafChoreId          },
+	{ "entropy1",       genpafEntropy1         },
+	{ "entropy2",       genpafEntropy2         },
 	{ "hspid",          genpafHspId            }, // (unadvertised)
 	{ "phash",          genpafPositionHash     }, // (unadvertised)
 	{ "ahash",          genpafAlignmentHash    }, // (unadvertised)

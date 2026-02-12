@@ -36,6 +36,10 @@ global int debug;				// how much debug info to show the programmer
 								//   0   => nothing
 								//   100 => everything
 
+#ifndef forbidBandWidth
+#define maxBandWidth (100*1000)	// maximum setting for bandWidth (in control
+								// .. structure below
+#endif // forbidBandWidth
 
 typedef struct infcontrol
 	{
@@ -240,6 +244,10 @@ typedef struct control
 								//              .. alignment
 	u32			tracebackMem;	//     number of bytes to allocate to track
 								//     .. gapped alignment traceback
+								//     ~~~ github issue 52 ~~~ 
+								//     though declared as a u32, tracebackMem
+								//     .. must *not* exceed the maximum signed
+								//     .. int
 	tback*		traceback;		//     memory in which to track gapped alignment
 								//     .. traceback
 	int			nIsAmbiguous;	//     true  => N is an ambiguous nucleotide
@@ -379,6 +387,13 @@ typedef struct control
 								//     .. sequence;  zero means no limit
 #endif // densityFiltering
 
+#ifndef forbidBandWidth
+	u32			bandWidth;		//     only seed hits within this distance
+								//     .. above the main diagonal will be 
+								//     .. processed;  zero means this is not
+								//     .. active
+#endif // not forbidBandWidth
+
 	char*		outputFilename;	//     name of the file to write output to
 	FILE*		outputFile;		//     file to write output to;  this may be
 								//     .. stdout
@@ -386,6 +401,8 @@ typedef struct control
 								//     .. of fmtXXX values (in output.h)
 	void*		outputInfo;		//     additional information for the particular
 								//     .. output format chosen
+	int			userSetMarkMismatches;//additional information for SAM format
+	int			samMarkMismatches;//   additional information for SAM format
 	char*		readGroup;		//     additional information for SAM format
 	char*		samRGTags;		//     additional information for SAM format
 	int			endComment;		//     true => write a comment at the end of the
@@ -400,6 +417,10 @@ typedef struct control
 	char*		dotplotFilename;//     name of the file to write dot plot to
 	FILE*		dotplotFile;	//     file to write dot plot to
 	char*		dotplotKeys;	//     genpaf keys for formatting dotplot
+	char*		axtFilename;	//     name of the file to write axt format to
+	FILE*		axtFile;		//     file to write axt format to
+	char*		mafFilename;	//     name of the file to write maf format to
+	FILE*		mafFile;		//     file to write maf format to
 
 	// for inner alignment (interpolation)
 
@@ -483,7 +504,6 @@ void finish_one_strand    (seq* target, u8* targetRev,
                            tback* traceback, census* targCensus);
 void split_anchors        (int id);
 void swap_anchor_sets     (void);
-void print_job_header     (void);
 
 //----------
 //

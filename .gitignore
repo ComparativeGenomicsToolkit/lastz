@@ -4,6 +4,7 @@
 src/lastz
 src/lastz_D
 src/lastz_32
+src/lastz_40
 
 # Makefile variants #
 ###################
@@ -16,3 +17,7 @@ test_results/base_test.*
 # OS generated files #
 ######################
 .DS_Store
+
+# Python compiled bytecode files #
+######################
+*.pyc
