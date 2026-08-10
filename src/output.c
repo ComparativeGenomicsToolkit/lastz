@@ -921,7 +921,9 @@ void print_match (unspos pos1, unspos pos2, unspos length, score s, u64 hspId)
 
 	if (--printsUntilFlush == 0)
 		{
-		fflush (outputFile);
+		// checked, so that a full disk is reported at the match that lost data
+		// rather than being discarded by the flush at exit
+		fflush_or_die (outputFile, currParams->outputFilename);
 		printsUntilFlush = matchFlushFrequency;
 		}
 

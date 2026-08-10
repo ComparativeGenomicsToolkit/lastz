@@ -1367,7 +1367,10 @@ next_target:
 									  currParams->capsuleFilename,
 		                              target, targetRev, targPositions,
 		                              currParams->hitSeed);
-		fclose_if_valid (currParams->capsuleFile);
+		// the message below claims the capsule was written, so the close has to
+		// be checked before that claim is made;  a truncated binary capsule
+		// would otherwise be reported as a success
+		fclose_or_die (currParams->capsuleFile, currParams->capsuleFilename);
 		currParams->capsuleFile = NULL;
 		endClock = clock();
 		printf ("%s byte target sequence capsule written to %s\n",
@@ -1935,6 +1938,27 @@ show_stats_and_clean_up:
 			}
 		}
 #endif // allowSeveralTargets
+
+	//////////
+	// close the output files, and make sure they actually landed
+	//
+	// this cannot live in the cleanup below, which only compiles in for the
+	// memory-checking builds;  a release build otherwise never closes an output
+	// file at all, and leaves the exit-time flush to discard any error, so a
+	// full disk yields a short alignment and a successful exit status.  The
+	// pointers are cleared so that the conditional fclose_if_valid calls below
+	// become no-ops rather than closing a second time.
+	//////////
+
+	fclose_or_die (lzParams.outputFile,     lzParams.outputFilename);     lzParams.outputFile     = NULL;
+	fclose_or_die (lzParams.dotplotFile,    lzParams.dotplotFilename);    lzParams.dotplotFile    = NULL;
+	fclose_or_die (lzParams.axtFile,        lzParams.axtFilename);        lzParams.axtFile        = NULL;
+	fclose_or_die (lzParams.mafFile,        lzParams.mafFilename);        lzParams.mafFile        = NULL;
+	fclose_or_die (lzParams.maskingFile,    lzParams.maskingFilename);    lzParams.maskingFile    = NULL;
+	fclose_or_die (lzParams.softMaskedFile, lzParams.softMaskedFilename); lzParams.softMaskedFile = NULL;
+	fclose_or_die (lzParams.censusFile,     lzParams.censusFilename);     lzParams.censusFile     = NULL;
+	// the stats file name is freed as soon as it is opened, so name it here
+	fclose_or_die (lzParams.statsFile,      "the statistics file");       lzParams.statsFile      = NULL;
 
 	//////////
 	// clean up
@@ -3498,7 +3522,9 @@ void finish_one_strand
 			}
 		if (currParams->deGapifyOutput) print_align_list_segments (alignList);
 		                           else print_align_list          (alignList);
-		fflush (currParams->outputFile);
+		// checked, so that a full disk stops the run here rather than after
+		// hours of further alignment whose output is silently discarded
+		fflush_or_die (currParams->outputFile, currParams->outputFilename);
 		dbg_timing_add (debugClockOutput);
 		}
 

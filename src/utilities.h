@@ -246,6 +246,8 @@ void  free_if_valid  (char* id, void* p);
 
 FILE*  fopen_or_die              (const char* name, const char* mode);
 int    fclose_if_valid           (FILE* f);
+void   fflush_or_die             (FILE* f, char* filename);
+void   fclose_or_die             (FILE* f, char* filename);
 int    getc_or_die               (FILE* f, char* filename);
 int    print_prefix              (FILE* f, const char* s, int n);
 char*  copy_string               (const char* s);

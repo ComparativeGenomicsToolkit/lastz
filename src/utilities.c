@@ -113,6 +113,93 @@ int fclose_if_valid
 
 //----------
 //
+// fflush_or_die--
+//	Push a file's buffer at the operating system, and make sure it got there.
+//
+//	stdio reports a failed write -- a full disk, a quota, a read-only mount --
+//	only by setting an error indicator that nothing is obliged to read, and at
+//	normal exit the C library flushes and discards any error.  Without this a
+//	truncated output file and a complete one are indistinguishable, and lastz
+//	still exits successfully.  A short MAF or PAF is still a valid one.
+//
+//	The flush is part of the check rather than an optimisation:  the buffer is
+//	not necessarily handed to the operating system until it happens, so a
+//	stream that has already lost data can still look clean beforehand.
+//
+//----------
+//
+// Arguments:
+//	FILE*	f:			The file to flush.  NULL is ignored.
+//	char*	filename:	The name of the file, for error reporting.  May be NULL.
+//
+// Returns:
+//	nothing;  failures are fatal
+//
+//----------
+
+void fflush_or_die
+   (FILE*	f,
+	char*	filename)
+	{
+	if (f == NULL) return;
+	if (filename == NULL)
+		filename = (f == stdout)? "standard output"
+		         : (f == stderr)? "standard error"
+		                        : "(unnamed file)";
+
+	if (fflush (f) != 0)
+		suicidef_with_perror ("failed to write %s, so its contents are incomplete",
+		                      filename);
+
+	// the indicator is sticky, so this catches a failure at any earlier point
+	// in the write, including one whose errno has since been overwritten
+	if (ferror (f))
+		suicidef ("failed to write %s, so its contents are incomplete;"
+		          " check the free space, the quota and the permissions"
+		          " on the file system holding it",
+		          filename);
+	}
+
+//----------
+//
+// fclose_or_die--
+//	Close a file we have written, making sure everything landed first.
+//
+//	Closing is the last point at which buffered data reaches the operating
+//	system, so a write that fails there is reported nowhere else.  The standard
+//	streams are checked but not closed, since the caller does not own them.
+//
+//----------
+//
+// Arguments:
+//	FILE*	f:			The file to close.  NULL is ignored.
+//	char*	filename:	The name of the file, for error reporting.  May be NULL.
+//
+// Returns:
+//	nothing;  failures are fatal
+//
+//----------
+
+void fclose_or_die
+   (FILE*	f,
+	char*	filename)
+	{
+	if (f == NULL) return;
+
+	fflush_or_die (f, filename);
+
+	if ((f == stdin) || (f == stdout) || (f == stderr)) return;
+
+	if (utilities_dbgDumpFilePointers)
+		fprintf (stderr, "fclose_or_die(%p)\n", f);
+
+	if (fclose (f) != 0)
+		suicidef_with_perror ("failed to close %s, so its contents may be incomplete",
+		                      (filename == NULL) ? "(unnamed file)" : filename);
+	}
+
+//----------
+//
 // getc_or_die--
 //	Read a character from a file.
 //
