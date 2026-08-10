@@ -141,15 +141,22 @@ void fflush_or_die
    (FILE*	f,
 	char*	filename)
 	{
-	if (f == NULL) return;
 	if (filename == NULL)
-		filename = (f == stdout)? "standard output"
+		filename = (f == NULL)?   "the output"
+		         : (f == stdout)? "standard output"
 		         : (f == stderr)? "standard error"
 		                        : "(unnamed file)";
 
+	// NULL means every open stream, as it does for fflush itself.  This matters:
+	// during --infer the parameters are switched to a block whose outputFile is
+	// never assigned, so the periodic flushes here were fflush(NULL) and were
+	// pushing the real output, --maf= and --axt= buffers out.  Returning early
+	// on NULL would have quietly stopped doing that.
 	if (fflush (f) != 0)
 		suicidef_with_perror ("failed to write %s, so its contents are incomplete",
 		                      filename);
+
+	if (f == NULL) return; // no single stream whose error indicator to test
 
 	// the indicator is sticky, so this catches a failure at any earlier point
 	// in the write, including one whose errno has since been overwritten
