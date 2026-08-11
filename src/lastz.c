@@ -1367,7 +1367,10 @@ next_target:
 									  currParams->capsuleFilename,
 		                              target, targetRev, targPositions,
 		                              currParams->hitSeed);
-		fclose_if_valid (currParams->capsuleFile);
+		// the message below claims the capsule was written, so the close has to
+		// be checked before that claim is made;  a truncated binary capsule
+		// would otherwise be reported as a success
+		fclose_or_die (currParams->capsuleFile, currParams->capsuleFilename);
 		currParams->capsuleFile = NULL;
 		endClock = clock();
 		printf ("%s byte target sequence capsule written to %s\n",
@@ -1935,6 +1938,27 @@ show_stats_and_clean_up:
 			}
 		}
 #endif // allowSeveralTargets
+
+	//////////
+	// close the output files, and make sure they actually landed
+	//
+	// this cannot live in the cleanup below, which only compiles in for the
+	// memory-checking builds;  a release build otherwise never closes an output
+	// file at all, and leaves the exit-time flush to discard any error, so a
+	// full disk yields a short alignment and a successful exit status.  The
+	// pointers are cleared so that the conditional fclose_if_valid calls below
+	// become no-ops rather than closing a second time.
+	//////////
+
+	fclose_or_die (lzParams.outputFile,     lzParams.outputFilename);     lzParams.outputFile     = NULL;
+	fclose_or_die (lzParams.dotplotFile,    lzParams.dotplotFilename);    lzParams.dotplotFile    = NULL;
+	fclose_or_die (lzParams.axtFile,        lzParams.axtFilename);        lzParams.axtFile        = NULL;
+	fclose_or_die (lzParams.mafFile,        lzParams.mafFilename);        lzParams.mafFile        = NULL;
+	fclose_or_die (lzParams.maskingFile,    lzParams.maskingFilename);    lzParams.maskingFile    = NULL;
+	fclose_or_die (lzParams.softMaskedFile, lzParams.softMaskedFilename); lzParams.softMaskedFile = NULL;
+	fclose_or_die (lzParams.censusFile,     lzParams.censusFilename);     lzParams.censusFile     = NULL;
+	// the stats file name is freed as soon as it is opened, so name it here
+	fclose_or_die (lzParams.statsFile,      "the statistics file");       lzParams.statsFile      = NULL;
 
 	//////////
 	// clean up
@@ -3498,7 +3522,9 @@ void finish_one_strand
 			}
 		if (currParams->deGapifyOutput) print_align_list_segments (alignList);
 		                           else print_align_list          (alignList);
-		fflush (currParams->outputFile);
+		// checked, so that a full disk stops the run here rather than after
+		// hours of further alignment whose output is silently discarded
+		fflush_or_die (currParams->outputFile, currParams->outputFilename);
 		dbg_timing_add (debugClockOutput);
 		}
 
@@ -5023,7 +5049,7 @@ static void format_options (void)
 	fprintf (helpout, "there may be a question as to whether or not lastz completed successfully.  The\n");
 	fprintf (helpout, "line \"# lastz end-of-file\" is written to output as the last line.  Note that\n");
 	fprintf (helpout, "in some formats this is *not* a legal line;  the user must remove it before any\n");
-	fprintf (helpout, "downstream processsing.\n");
+	fprintf (helpout, "downstream processing.\n");
 
 	exit (EXIT_FAILURE);
 	}
@@ -7945,6 +7971,26 @@ static void parse_options_loop
 		 || (strcmp (arg, "--help=yasra") == 0))
 			{ expander_options ("yasra-specific options", "--yasra"); }
 
+		// --help=sizes and --help=sizes:noerror (unadvertised)
+
+		if (strcmp (arg, "--help=sizes:noerror") == 0)
+			{
+			exitVal = EXIT_SUCCESS;
+			goto report_sizes;
+			}
+
+		if (strcmp (arg, "--help=sizes") == 0)
+			{
+			exitVal = EXIT_FAILURE;
+		report_sizes:
+			report_basic_types         (stderr);
+			fprintf                    (stderr,"\n");
+			report_sequence_types      (stderr);
+			fprintf                    (stderr,"\n");
+			report_gapped_extend_types (stderr);
+			exit (exitVal);
+			}
+
 		// --force:<what> (unadvertised)
 
 		if ((strcmp (arg, "--force:reportfilteredhsps") == 0)
@@ -8927,9 +8973,9 @@ static void parse_options
 	if (forceReportFilteredHsps)
 		{
 		if (lzParams->gappedExtend)
-			chastise ("-force:reportfilteredhsps can only be used with --nogapped\n");
+			chastise ("--force:reportfilteredhsps can only be used with --nogapped\n");
 		if (lzParams->hspThreshold.t != 'S')   // (hsps are adaptive)
-			chastise ("-force:reportfilteredhsps cannot be used with an adaptive HSP threshold\n");
+			chastise ("--force:reportfilteredhsps cannot be used with an adaptive HSP threshold\n");
 		}
 
 	//////////
@@ -9141,7 +9187,7 @@ static void parse_options
 
 		if ((haveGapOpen) && (gapOpen + gapExtend <= 0))
 			chastise ("%s is not a valid gap open penalty with extension penalty %s\n"
-			          "(open can be negative but the sum has to be postive)\n",
+			          "(open can be negative but the sum has to be positive)\n",
 			          gapOpenStr, gapExtendStr);
 		if ((haveGapExtend) && (gapExtend < 0))
 			chastise ("%s is not a valid gap extension penalty\n", gapExtendStr);

@@ -246,6 +246,8 @@ void  free_if_valid  (char* id, void* p);
 
 FILE*  fopen_or_die              (const char* name, const char* mode);
 int    fclose_if_valid           (FILE* f);
+void   fflush_or_die             (FILE* f, char* filename);
+void   fclose_or_die             (FILE* f, char* filename);
 int    getc_or_die               (FILE* f, char* filename);
 int    print_prefix              (FILE* f, const char* s, int n);
 char*  copy_string               (const char* s);
@@ -293,6 +295,7 @@ void   suicide                   (const char* message);
 void   suicidef                  (const char* format, ...);
 void   suicide_with_perror       (const char* message);
 void   suicidef_with_perror      (const char* format, ...);
+void   report_basic_types        (FILE* f);
 
 #undef global
 #endif // utilities_H
