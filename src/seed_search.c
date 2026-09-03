@@ -461,6 +461,16 @@ void free_seed_hit_search (void) { free_diag_hash (); }
 //				const u8* const	qStop  = seq2->v + end;
 //				const u8* 		q;
 
+static inline int pf_head_occupied (const unspos* heads, int n, int k)
+	{
+	if (k >= n) return true;					// (not cached => assume occupied)
+	return ((heads[k] != 0) && (heads[k] != noPreviousPos));
+	}
+
+// (speed) how many probes' chain heads we cache per query position;  a 12of19
+// .. seed with one transition makes 13 probes
+#define maxPfHeads 20
+
 static u64 private_hit_search (void)
 	{
 	int		seedLength;
@@ -474,6 +484,17 @@ static u64 private_hit_search (void)
 	unspos	pos2;
 	u32*	f1, *f2;
 	u64		basesHit = 0;
+	// (speed) pt->last[] for this query position's probes, filled by the
+	// .. prefetch loop below and consumed instead of being read a second time
+	// .. inside find_table_matches.  Entries 0..pfHeadsN-1 are valid;  beyond
+	// .. that pfHeadOccupied() reports occupied so the call still happens.
+	unspos	pfHead[maxPfHeads];
+	int		pfHeadsN = 0, pfIx = 0;
+	// nota bene: this is deliberately NOT a macro.  As a macro taking (++pfIx) it
+	// .. evaluated its argument up to three times, silently skipping live probes;
+	// .. the unmasked and --self gate cases caught it, the soft-masked ones did not.
+#define pfHeadOccupied(k) pf_head_occupied (pfHead, pfHeadsN, (k))
+
 #if ((defined collect_stats) && (defined maxHitsPerColumn))
 	u64		prevRawHits, hitsInColumn;
 #endif // collect_stats && maxHitsPerColumn
@@ -543,6 +564,7 @@ static u64 private_hit_search (void)
 			// .. and the sequence-1 bytes the x-drop extension will read.  Most
 			// .. of the 13 probes are empty, so this costs little.  Read-only:
 			// .. processing order is untouched.
+			pfIx = 0;
 			{
 			u32*      pfF;
 			u32       pfW = packed;
@@ -553,18 +575,30 @@ static u64 private_hit_search (void)
 			for (pfF=hitSeed->transFlips ; ; pfF++)
 				{
 				unspos h = pt->last[pfW];
+				pfHead[pfN] = h;
 				if ((h != 0) && (h != noPreviousPos))
 					{
 					__builtin_prefetch (&pt->prev[h], 0, 3);
 					__builtin_prefetch (pfSeq + pfAdj + pfStep*h, 0, 3);
 					}
-				if ((hitSeed->withTrans < 1) || (*pfF == 0) || (++pfN > 16)) break;
+				if ((hitSeed->withTrans < 1) || (*pfF == 0)
+				 || (++pfN >= maxPfHeads)) break;
 				pfW = packed ^ (*pfF);
 				}
+			pfHeadsN = pfN + 1;
 			}
 
 			debugSearchPos2_1;
-			basesHit += find_table_matches (packed, pos2);
+			// (speed) the head loaded above already says whether this word occurs in
+			// .. the target at all;  ~80% of probes are empty at --step=5 and ~59% at
+			// .. --step=2, and skipping those avoids the call and a second read of
+			// .. pt->last[].  This is the first place a value read from pt->last[] is
+			// .. USED rather than only prefetched, so it relies on the table being
+			// .. stable across (*processor)() calls -- it is:  add_word writes it at
+			// .. build time, limit_position_table before the search, and
+			// .. mask_seed_position_table only from finish_one_strand afterwards.
+			if (pfHeadOccupied (0))
+				basesHit += find_table_matches (packed, pos2);
 
 			// generate seed hits for all seed matches with 1 or 2 transitions
 
@@ -574,7 +608,8 @@ static u64 private_hit_search (void)
 					{
 					packedTrans = packed ^ (*f1);
 					debugSearchPos2_2;
-					basesHit += find_table_matches (packedTrans, pos2);
+					if (pfHeadOccupied (++pfIx))
+						basesHit += find_table_matches (packedTrans, pos2);
 					}
 				}
 			else if (hitSeed->withTrans >= 2)
@@ -618,6 +653,8 @@ static u64 private_hit_search (void)
 	return basesHit;
 	}
 
+
+#undef pfHeadOccupied
 
 // private_hit_search_halfweight-- seed requires one bit per unpacked bp
 
@@ -863,6 +900,7 @@ static u64 find_table_matches
 	u64		basesHit = 0;
 	const unspos*	prevTable = pt->prev;
 	const u8*		s1v       = seq1->v;
+	unspos			nextPos;
 
 	seedLength = (unsigned) hitSeed->length;
 	len1       = seedLength-1;
@@ -876,18 +914,24 @@ static u64 find_table_matches
 		return 0;
 		}
 
-	for (pos=pt->last[packed2] ; pos!=noPreviousPos ; pos=pt->prev[pos])
+	for (pos=pt->last[packed2] ; pos!=noPreviousPos ; pos=nextPos)
 		{
-		pos1 = adjStart + step*pos;
-		{
-		unspos np = prevTable[pos];
-		if (np != noPreviousPos)
+		// (speed) this load is the chain link for the *next* iteration and the
+		// .. address of the sequence bytes to prefetch, so we need it here
+		// .. anyway;  consuming it in the loop increment as well stops gcc
+		// .. re-reading pt->prev[pos] -- and re-loading the pt global to find
+		// .. pt->prev -- after the indirect (*processor)() call, which it
+		// .. cannot prove leaves the table alone.  Safe on the same invariant
+		// .. the prefetch already relies on: the position table is not
+		// .. modified during a search.
+		nextPos = prevTable[pos];
+		pos1    = adjStart + step*pos;
+		if (nextPos != noPreviousPos)
 			{
-			const u8* nxt = s1v + adjStart + ((unspos) step) * np;
+			const u8* nxt = s1v + adjStart + ((unspos) step) * nextPos;
 			__builtin_prefetch (nxt,      0, 3);
 			__builtin_prefetch (nxt - 64, 0, 3);
 			}
-		}
 
 #ifdef debugSearchPos2
 		if (pos2 == debugSearchPos2)
@@ -2677,9 +2721,14 @@ static score xdrop_extend_seed_hit
 	runScore  = leftScore = 0;
 
 	// (speed) `floor` is leftScore-xDrop maintained incrementally, so the loop
-	// .. test is a bare compare;  the running-maximum update is written as two
-	// .. selects so gcc emits cmovs instead of a data-dependent branch that
-	// .. mispredicts on every new maximum
+	// .. test is a bare compare instead of a subtract and compare.
+	// .. The running-maximum update below is deliberately left as a branch.
+	// .. Writing it as selects does get gcc to emit cmovs -- as a branch it
+	// .. emits none, and jumps to an out-of-line fixup that spills leftStart to
+	// .. the stack on every new maximum -- but that was measured SLOWER,
+	// .. 25.9s vs 24.6s on warty x palmate.  A new maximum is rare once the
+	// .. extension starts falling, so the branch predicts well, while the cmov
+	// .. puts the update on the dependency chain of every iteration.
 	{
 	score	floor = -xDrop;
 
