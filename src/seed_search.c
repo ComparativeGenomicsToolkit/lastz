@@ -518,6 +518,51 @@ static u64 private_hit_search (void)
 #if ((defined collect_stats) && (defined maxHitsPerColumn))
 			prevRawHits = seedSearchStats.rawSeedHits;
 #endif // collect_stats && maxHitsPerColumn
+			// (speed) prefetch the table probes for the NEXT query position while
+			// .. we do the work for this one.  pt->last[] is much larger than L3
+			// .. so every probe is a cold miss;  a full position of lead time is
+			// .. enough for them to land.  Purely a prefetch: the word is
+			// .. recomputed normally on the next iteration, nothing is carried.
+			if (q+1 < qStop)
+				{
+				s32 wwNext = upperCharToBits[q[1]];
+				if (wwNext >= 0)
+					{
+					u32  pkNext = apply_seed (hitSeed, (w << 2) | wwNext);
+					u32* pf;
+					__builtin_prefetch (&pt->last[pkNext], 0, 3);
+					if (hitSeed->withTrans >= 1)
+						for (pf=hitSeed->transFlips ; *pf!=0 ; pf++)
+							__builtin_prefetch (&pt->last[pkNext ^ (*pf)], 0, 3);
+					}
+				}
+
+			// (speed) resolve the chain heads now, while the last[] lines just
+			// .. prefetched are still warm, and start the two cold loads that
+			// .. follow each head:  prev[head] (the chain link, 18% of runtime)
+			// .. and the sequence-1 bytes the x-drop extension will read.  Most
+			// .. of the 13 probes are empty, so this costs little.  Read-only:
+			// .. processing order is untouched.
+			{
+			u32*      pfF;
+			u32       pfW = packed;
+			unspos    pfAdj  = pt->adjStart;
+			u32       pfStep = pt->step;
+			const u8* pfSeq  = seq1->v;
+			int       pfN    = 0;
+			for (pfF=hitSeed->transFlips ; ; pfF++)
+				{
+				unspos h = pt->last[pfW];
+				if ((h != 0) && (h != noPreviousPos))
+					{
+					__builtin_prefetch (&pt->prev[h], 0, 3);
+					__builtin_prefetch (pfSeq + pfAdj + pfStep*h, 0, 3);
+					}
+				if ((hitSeed->withTrans < 1) || (*pfF == 0) || (++pfN > 16)) break;
+				pfW = packed ^ (*pfF);
+				}
+			}
+
 			debugSearchPos2_1;
 			basesHit += find_table_matches (packed, pos2);
 
@@ -816,6 +861,8 @@ static u64 find_table_matches
 	u32		step     = pt->step;
 	unspos	pos, pos1;
 	u64		basesHit = 0;
+	const unspos*	prevTable = pt->prev;
+	const u8*		s1v       = seq1->v;
 
 	seedLength = (unsigned) hitSeed->length;
 	len1       = seedLength-1;
@@ -832,6 +879,15 @@ static u64 find_table_matches
 	for (pos=pt->last[packed2] ; pos!=noPreviousPos ; pos=pt->prev[pos])
 		{
 		pos1 = adjStart + step*pos;
+		{
+		unspos np = prevTable[pos];
+		if (np != noPreviousPos)
+			{
+			const u8* nxt = s1v + adjStart + ((unspos) step) * np;
+			__builtin_prefetch (nxt,      0, 3);
+			__builtin_prefetch (nxt - 64, 0, 3);
+			}
+		}
 
 #ifdef debugSearchPos2
 		if (pos2 == debugSearchPos2)
@@ -2620,7 +2676,14 @@ static score xdrop_extend_seed_hit
 	leftStart = s1;
 	runScore  = leftScore = 0;
 
-	while ((s1 > stop) && (runScore >= leftScore-xDrop))
+	// (speed) `floor` is leftScore-xDrop maintained incrementally, so the loop
+	// .. test is a bare compare;  the running-maximum update is written as two
+	// .. selects so gcc emits cmovs instead of a data-dependent branch that
+	// .. mispredicts on every new maximum
+	{
+	score	floor = -xDrop;
+
+	while ((s1 > stop) && (runScore >= floor))
 		{
 		snoopXDrop_Left;
 		runScore += scoring->sub[*(--s1)][*(--s2)];
@@ -2628,8 +2691,10 @@ static score xdrop_extend_seed_hit
 			{
 			leftStart = s1;
 			leftScore = runScore;
+			floor     = runScore - xDrop;
 			}
 		}
+	}
 
 	// adjust length if the extension is shorter than the hit
 
@@ -2681,7 +2746,10 @@ static score xdrop_extend_seed_hit
 	rightStop = s1;
 	runScore = rightScore = 0;
 
-	while ((s1 < stop) && (runScore >= rightScore-xDrop))
+	{
+	score	floor = -xDrop;
+
+	while ((s1 < stop) && (runScore >= floor))
 		{
 		snoopXDrop_Right;
 		runScore += scoring->sub[*(s1++)][*(s2++)];
@@ -2689,8 +2757,10 @@ static score xdrop_extend_seed_hit
 			{
 			rightStop  = s1;
 			rightScore = runScore;
+			floor      = runScore - xDrop;
 			}
 		}
+	}
 	rightBlock = s1;
 
 	// adjust length if the extension is shorter than the hit
