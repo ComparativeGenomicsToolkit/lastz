@@ -27,7 +27,37 @@
 #include "build_options.h"		// build options
 
 #define  utilities_owner		// (make this the owner of its globals)
+#if (defined __linux__)
+#include <sys/mman.h>			// madvise, MADV_HUGEPAGE
+#endif
 #include "utilities.h"			// interface to this module
+
+//----------
+//
+// hint_huge_pages--
+//	Ask the kernel to back a large allocation with 2 MB pages.  lastz's biggest
+//	arrays -- the seed position table (~100 MB here) and the sequences (50 MB
+//	each) -- are read at essentially random offsets, so on 4 KB pages nearly
+//	every access is also a dTLB miss and a page-table walk.  This is only a
+//	hint:  if transparent huge pages are disabled, or the range cannot be
+//	backed, the call is a no-op and nothing breaks.
+//
+//----------
+
+static void hint_huge_pages (void* p, size_t size)
+	{
+#if ((defined __linux__) && (defined MADV_HUGEPAGE))
+	uintptr_t	lo, hi;
+
+	if (size < (16*1024*1024)) return;	// (not worth it for small blocks)
+
+	lo = (((uintptr_t) p) + 0x1FFFFF) & ~(uintptr_t) 0x1FFFFF;
+	hi = (((uintptr_t) p) + size)     & ~(uintptr_t) 0x1FFFFF;
+	if (hi > lo) (void) madvise ((void*) lo, (size_t) (hi - lo), MADV_HUGEPAGE);
+#else
+	(void) p;  (void) size;
+#endif
+	}
 
 //----------
 //
@@ -228,7 +258,13 @@ int getc_or_die
 	{
 	int		ch;
 
+	// (speed) lastz is single threaded, so getc()'s per-character lock is pure
+	// .. overhead;  reading a 50 Mb FASTA takes 50 million of them
+#if ((defined __GLIBC__) || (defined __APPLE__))
+	ch = getc_unlocked (f);
+#else
 	ch = getc (f);
+#endif
 	if (ch != EOF) return ch & 0xFF;
 
 	if (ferror (f))
@@ -342,6 +378,7 @@ void* malloc_or_die
 			          ucommatize(size), id);
 		}
 
+	hint_huge_pages (p, size);
 	reportAlloc (id, p, size);
 
 	return p;
@@ -401,6 +438,7 @@ void* realloc_or_die
 			          ucommatize(size), id);
 		}
 
+	hint_huge_pages (p, size);
 	reportRealloc (id, _p, p, size);
 
 	return p;

@@ -2960,6 +2960,20 @@ static void lop_final_indels
 //			  yes     yes  | -R  -L  | -R+1 -L-1 |
 //			---------------+---------+-----------+
 //
+// (15)	The column loop's bound.  b is initialized to B+col+1 and is advanced
+//		exactly once per pass -- in the loop tail, or inside prune -- while col
+//		is advanced exactly once per pass by the loop header.  So (b-B)==col+1
+//		is a loop invariant, and BLASTZ's second bound (unspos)(b-B)<=N+1 is
+//		just col<N+1.  RY is not modified by the column loop (only LY is, by
+//		prune), so both bounds fold into colStop = min(RY,N+1), once per row.
+//
+// (16)	The boundary rule of note (12) can only fire when trimToPeak is false,
+//		and then only in the last row or in column N.  trimToPeak is constant
+//		for the call and row is constant for the row, so the whole test folds
+//		into one per-row threshold: col >= boundaryThresh.  Likewise
+//		bestScore-yDrop is recomputed in every cell although bestScore changes
+//		rarely, so it is maintained incrementally as yThresh.
+//
 //----------
 
 //=== macros for ydrop_one_sided_align ===
@@ -3425,6 +3439,10 @@ static score ydrop_one_sided_align
 	unspos		prevLY;				// left column limit for previous row
 	sgnpos		NN;					// truncated right side bound, current row
 	unspos		npCol;				// last non-pruned cell in current row
+	unspos		colStop;			// == min(RY,N+1);  the column loop's only bound
+									// .. (see note (15))
+	unspos		boundaryThresh;		// col >= boundaryThresh <=> the note (12)
+									// .. boundary rule can fire in this cell
 	unspos		end1, end2;			// end of optimal alignment
 	int			endIsBoundary;		// true => report boundaryScore instead of
 									//         .. bestScore
@@ -3437,6 +3455,7 @@ static score ydrop_one_sided_align
 	u8*			b;					// scans horizontal sequence
 	score		c, d, i;			// running scores for DP cells
 	score		cOpen, cNext, cTemp;// scratch values for cell scores
+	score		yThresh;			// == bestScore - yDrop, maintained incrementally
 	activeseg*	active;				// list of segments that intersect the
 									// .. sweep row within the feasible region
 	galign*		alignList;
@@ -3601,6 +3620,7 @@ static score ydrop_one_sided_align
 
 	end1 = end2 = 0;
 	bestScore = 0;
+	yThresh   = bestScore - yDrop;	// (see note (16))
 	boundaryScore = negInf;
 	endIsBoundary = false;
 
@@ -3677,10 +3697,21 @@ static score ydrop_one_sided_align
 		b = B + col + 1;	// (b scans horizontal sequence, one column ahead)
 		npCol = col;		// npCol records the last non-pruned position
 
+		// (speed) see note (15):  (b-B)==col+1 is a loop invariant, so BLASTZ's
+		// .. second bound (unspos)(b-B)<=N+1 is just col<N+1, and RY is not
+		// .. changed by the column loop -- fold both into one per-row bound.
+		// .. See note (16) for boundaryThresh:  the note (12) boundary rule can
+		// .. only fire when trimToPeak is false, and then only in the last row
+		// .. or in column N, all of which are constant across the row.
+		colStop = (RY < (unspos) (N+1))? RY : (unspos) (N+1);
+		if (trimToPeak)      boundaryThresh = colStop;    // (can never fire)
+		else if (row == M)   boundaryThresh = 0;          // (fires every cell)
+		else                 boundaryThresh = (unspos) N; // (only at col==N)
+
 		i = negInf;			// 'set' I[row][col]
 		c = negInf;			// propose C[row][col]
 
-		for ( ; (col<RY)&&((unspos)(b-B)<=N+1) ; col++)
+		for ( ; col<colStop ; col++)
 			{
 #ifdef snoopAlgorithm
 			if (snoop)
@@ -3714,7 +3745,7 @@ static score ydrop_one_sided_align
 				if (d >= i) { c = d;  link = cFromD | iExtend | dExtend; }
 				       else { c = i;  link = cFromI | iExtend | dExtend; }
 				snoopAlgorithm_5;
-				if (c < bestScore - yDrop)
+				if (c < yThresh)
 					{ prune;  snoopAlgorithm_5B;  continue; }
 
 #ifndef allowBackToBackGaps
@@ -3736,17 +3767,17 @@ static score ydrop_one_sided_align
 			else							// === we CANNOT improve C ===
 				{
 				snoopAlgorithm_5;
-				if (c < bestScore - yDrop)
+				if (c < yThresh)
 					{ prune;  snoopAlgorithm_5B;  continue; }
 
 				if (c >= bestScore)
 					{
-					bestScore = c;  end1 = row;  end2 = col;  endIsBoundary = false;
+					bestScore = c;  yThresh = c - yDrop;
+					end1 = row;  end2 = col;  endIsBoundary = false;
 					snoopAlgorithm_5A;
 					}
-				if ((!trimToPeak)
-				      && (c >= boundaryScore)
-				      && ((row == M) || (col == N)))
+				if ((col >= boundaryThresh)		// (folds !trimToPeak and
+				      && (c >= boundaryScore))	// .. row==M || col==N)
 					{ boundaryScore = c;  end1 = row;  end2 = col;  endIsBoundary = true; }
 
 				cOpen = c - gapOE;
@@ -3798,7 +3829,7 @@ static score ydrop_one_sided_align
 			// insertions (see note (9))
 
 			snoopAlgorithm_7C;
-			while ((i >= bestScore - yDrop) && (((sgnpos)RY) <= NN))
+			while ((i >= yThresh) && (((sgnpos)RY) <= NN))
 				{
 				if (((u32)(dq - dynProg->p)) >= dynProg->len)
 					suicidef("(in ydrop_one_sided_align:%d, dq-dynProg->p==%d, dynProg->len=" unsposFmt ")",
@@ -4091,9 +4122,18 @@ static void align_left_right
 	mRightOfBottom = mLeftOfBottom = mRightOfTop   = mLeftOfTop = NULL;
 	bRightOfBottom = bRightOfTop   = bLeftOfBottom = bLeftOfTop = NULL;
 
-	for ( ; obi!=NULL ; obi=obi->next)
+	// (speed) obi is ordered by increasing beginning point (see the argument
+	// .. comment above, and insert_align, which maintains it), so the scan can
+	// .. stop at the first alignment that begins past the end of m -- no later
+	// .. one can overlap m either, and they would all hit the continue below.
+	// .. That bounds a scan which was over every alignment found so far, a list
+	// .. that only grows.  The test belongs in the loop header, not as a break
+	// .. in the body: as a second loop exit it cost 2.4% on sparse input, where
+	// .. the list is short and the saving does not arise.  end1 is not sorted,
+	// .. so that half of the original test stays a continue.
+	for ( ; (obi!=NULL)&&(obi->pos1<=end1) ; obi=obi->next)
 		{
-		if ((obi->pos1 > end1) || (obi->end1 < pos1))
+		if (obi->end1 < pos1)
 			continue;
 
 		// invariant: obi->pos1 <= end1   and   obi->end1 >= pos1
