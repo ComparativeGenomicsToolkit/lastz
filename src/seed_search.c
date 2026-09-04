@@ -931,6 +931,14 @@ static u64 find_table_matches
 			const u8* nxt = s1v + adjStart + ((unspos) step) * nextPos;
 			__builtin_prefetch (nxt,      0, 3);
 			__builtin_prefetch (nxt - 64, 0, 3);
+			// (speed) reach one link further down the chain.  At --step=1 the
+			// .. position table is five times denser than at --step=5, chains are
+			// .. correspondingly longer, and prev[] is 79% of this function's
+			// .. time on human/mouse.  Issuing the second link's load here puts
+			// .. it in flight during the processor call as well;  its address
+			// .. depends on the first, so the two serialise against each other
+			// .. but both overlap the extension work.
+			__builtin_prefetch (&prevTable[nextPos], 0, 3);
 			}
 
 #ifdef debugSearchPos2
