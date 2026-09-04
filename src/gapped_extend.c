@@ -4122,9 +4122,18 @@ static void align_left_right
 	mRightOfBottom = mLeftOfBottom = mRightOfTop   = mLeftOfTop = NULL;
 	bRightOfBottom = bRightOfTop   = bLeftOfBottom = bLeftOfTop = NULL;
 
-	for ( ; obi!=NULL ; obi=obi->next)
+	// (speed) obi is ordered by increasing beginning point (see the argument
+	// .. comment above, and insert_align, which maintains it), so the scan can
+	// .. stop at the first alignment that begins past the end of m -- no later
+	// .. one can overlap m either, and they would all hit the continue below.
+	// .. That bounds a scan which was over every alignment found so far, a list
+	// .. that only grows.  The test belongs in the loop header, not as a break
+	// .. in the body: as a second loop exit it cost 2.4% on sparse input, where
+	// .. the list is short and the saving does not arise.  end1 is not sorted,
+	// .. so that half of the original test stays a continue.
+	for ( ; (obi!=NULL)&&(obi->pos1<=end1) ; obi=obi->next)
 		{
-		if ((obi->pos1 > end1) || (obi->end1 < pos1))
+		if (obi->end1 < pos1)
 			continue;
 
 		// invariant: obi->pos1 <= end1   and   obi->end1 >= pos1
